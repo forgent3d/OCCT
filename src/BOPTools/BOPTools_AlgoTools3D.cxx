@@ -141,6 +141,10 @@ Standard_Boolean BOPTools_AlgoTools3D::DoSplitSEAMOnFace(const TopoDS_Edge& aSpl
   //
   //---------------------------------------------------
   C2D1 = BRep_Tool::CurveOnSurface(aSp, aF, a, b);
+  // forgent3d patch: a split with no pcurve on the face was dereferenced — a null virtual call,
+  // a crash (wasm: "getWasmTableEntry(...) is not a function") fusing corpus 2144990's grip
+  if (C2D1.IsNull())
+    return Standard_False;
   //
   aT = BOPTools_AlgoTools2D::IntermediatePoint(a, b);
   C2D1->D1(aT, aP2D, aVec2D);
@@ -252,6 +256,9 @@ Standard_Boolean BOPTools_AlgoTools3D::DoSplitSEAMOnFace(const TopoDS_Edge& theE
     BRep_Tool::CurveOnSurface(TopoDS::Edge(theEOrigin.Oriented(TopAbs_FORWARD)), aFace, aT1, aT2);
   Handle(Geom2d_Curve) aC2D2 =
     BRep_Tool::CurveOnSurface(TopoDS::Edge(theEOrigin.Oriented(TopAbs_REVERSED)), aFace, aT1, aT2);
+  // forgent3d patch: the same unchecked dereference as the overload above
+  if (aC2D1.IsNull() || aC2D2.IsNull())
+    return Standard_False;
 
   Standard_Real aT = BOPTools_AlgoTools2D::IntermediatePoint(aTS1, aTS2);
   gp_Pnt2d      aPMid;
