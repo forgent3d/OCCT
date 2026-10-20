@@ -29,6 +29,8 @@
 #include <gp_Pln.hxx>
 #include <gp_Pnt.hxx>
 #include <gp_Cone.hxx>
+#include <gp_Torus.hxx>
+#include <cmath>
 #include <Precision.hxx>
 #include <TColgp_Array2OfPnt.hxx>
 #include <TColStd_Array1OfInteger.hxx>
@@ -477,6 +479,81 @@ void BndLib_AddSurface::AddOptimal(const Adaptor3d_Surface& S, const Standard_Re
 
 //=================================================================================================
 
+// The exact box of a ring torus's patch [UMin, UMax] x [VMin, VMax] (forgent3d patch). Along any axis
+// the coordinate is C + (R + r cos v)(a cos u + b sin u) + r c sin v: stationary in u where
+// tan u = b / a, in v where tan v = c / (a cos u + b sin u). Every extreme is a combination of those
+// angles and the patch's edges, so the box is those points' box. AddGenSurf's sampled search it
+// replaces took ~12 ms a fillet face (a 296-fillet part's box: 1.4 s native, ~14 s in wasm).
+static Standard_Boolean AddTorusPatch(const gp_Torus&     T,
+                                      const Standard_Real UMin,
+                                      const Standard_Real UMax,
+                                      const Standard_Real VMin,
+                                      const Standard_Real VMax,
+                                      const Standard_Real Tol,
+                                      Bnd_Box&            B)
+{
+  const Standard_Real R = T.MajorRadius(), r = T.MinorRadius();
+  if (!(R > r) || UMax - UMin < 0. || VMax - VMin < 0.)
+  {
+    return Standard_False; // a spindle torus reaches its axis: the generic search keeps it
+  }
+  const gp_Ax3& ax    = T.Position();
+  const gp_XYZ  X     = ax.XDirection().XYZ(), Y = ax.YDirection().XYZ(), Z = ax.Direction().XYZ();
+  const Standard_Real twoPi = 2. * M_PI;
+  // t brought into [lo, lo + 2pi) — kept when that lands inside [lo, hi]
+  auto within = [twoPi](Standard_Real t, Standard_Real lo, Standard_Real hi, Standard_Real& out) {
+    Standard_Real d = std::fmod(t - lo, twoPi);
+    if (d < 0.)
+    {
+      d += twoPi;
+    }
+    if (lo + d <= hi + Precision::PConfusion())
+    {
+      out = Min(lo + d, hi);
+      return true;
+    }
+    return false;
+  };
+  Bnd_Box box;
+  for (Standard_Integer k = 1; k <= 3; k++)
+  {
+    const Standard_Real a = X.Coord(k), b = Y.Coord(k), c = Z.Coord(k);
+    Standard_Real       us[4] = {UMin, UMax, 0., 0.};
+    Standard_Integer    nu    = 2;
+    const Standard_Real theta = std::atan2(b, a);
+    for (Standard_Real t : {theta, theta + M_PI})
+    {
+      Standard_Real got;
+      if (within(t, UMin, UMax, got))
+      {
+        us[nu++] = got;
+      }
+    }
+    for (Standard_Integer i = 0; i < nu; i++)
+    {
+      const Standard_Real s     = a * std::cos(us[i]) + b * std::sin(us[i]);
+      Standard_Real       vs[4] = {VMin, VMax, 0., 0.};
+      Standard_Integer    nv    = 2;
+      const Standard_Real phi   = std::atan2(c, s);
+      for (Standard_Real t : {phi, phi + M_PI})
+      {
+        Standard_Real got;
+        if (within(t, VMin, VMax, got))
+        {
+          vs[nv++] = got;
+        }
+      }
+      for (Standard_Integer j = 0; j < nv; j++)
+      {
+        box.Add(ElSLib::Value(us[i], vs[j], T));
+      }
+    }
+  }
+  box.Enlarge(Max(Tol, Precision::Confusion())); // the margin AddGenSurf gives its box
+  B.Add(box);
+  return Standard_True;
+}
+
 void BndLib_AddSurface::AddOptimal(const Adaptor3d_Surface& S,
                                    const Standard_Real      UMin,
                                    const Standard_Real      UMax,
@@ -525,6 +602,13 @@ void BndLib_AddSurface::AddOptimal(const Adaptor3d_Surface& S,
     }
     case GeomAbs_Sphere: {
       BndLib::Add(S.Sphere(), UMin, UMax, VMin, VMax, Tol, B);
+      break;
+    }
+    case GeomAbs_Torus: {
+      if (!AddTorusPatch(S.Torus(), UMin, UMax, VMin, VMax, Tol, B))
+      {
+        AddGenSurf(S, UMin, UMax, VMin, VMax, Tol, B);
+      }
       break;
     }
     default: {
