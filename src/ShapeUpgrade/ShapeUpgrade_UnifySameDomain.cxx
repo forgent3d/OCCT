@@ -89,6 +89,24 @@
 #include <BRepBuilderAPI_MakeEdge.hxx>
 #include <ElSLib.hxx>
 #include <GeomProjLib.hxx>
+#include <string>
+
+// forgent3d patch: a watchdog. Build() resets a step count; the unbounded loops below count their
+// iterations and give up (throw) past a fixed budget — the caller keeps the unmerged shape. Merging
+// a rounded box with a same-radius rounded plate (coincident cylinders ending on tangent spheres)
+// never returned. Steps, not seconds: the same model must merge the same way on a busy machine.
+namespace
+{
+long long THE_USD_STEPS = 0;
+long long THE_USD_LIMIT = 5000000LL;
+
+inline void USDWatch(int theLine)
+{
+  if (++THE_USD_STEPS > THE_USD_LIMIT)
+    throw Standard_Failure(
+      (std::string("ShapeUpgrade_UnifySameDomain: gave up (line ") + std::to_string(theLine) + ")").c_str());
+}
+} // namespace
 
 IMPLEMENT_STANDARD_RTTIEXT(ShapeUpgrade_UnifySameDomain, Standard_Transient)
 
@@ -295,6 +313,7 @@ static void RemoveEdgeFromMap(const TopoDS_Edge&                         theEdge
     TopTools_ListIteratorOfListOfShape itl(Elist);
     while (itl.More())
     {
+      USDWatch(__LINE__);
       const TopoDS_Shape& anEdge = itl.Value();
       if (anEdge.IsSame(theEdge))
         Elist.Remove(itl);
@@ -316,6 +335,15 @@ static Standard_Real ComputeMinEdgeSize(const TopTools_SequenceOfShape& theEdges
     theEdgesMap.Add(anEdge);
     TopoDS_Vertex V1, V2;
     TopExp::Vertices(anEdge, V1, V2);
+    // forgent3d patch: an edge with no pcurve on the reference face made the adaptor below
+    // dereference a null curve (native: segfault; wasm: a garbage vtable — "memory access out of
+    // bounds" / "null function or function signature mismatch", 22 corpus files). Give up the
+    // merge instead; the caller keeps the unmerged shape.
+    {
+      Standard_Real aF, aL;
+      if (BRep_Tool::CurveOnSurface(anEdge, theRefFace, aF, aL).IsNull())
+        throw Standard_Failure("ShapeUpgrade_UnifySameDomain: an edge has no pcurve on the face being merged");
+    }
     BRepAdaptor_Curve2d BAcurve2d(anEdge, theRefFace);
     gp_Pnt2d            FirstP2d = BAcurve2d.Value(BAcurve2d.FirstParameter());
     gp_Pnt2d            LastP2d  = BAcurve2d.Value(BAcurve2d.LastParameter());
@@ -467,6 +495,7 @@ static void RelocatePCurvesToNewUorigin(
 
   for (;;) // walk by contours
   {
+    USDWatch(__LINE__);
     // try to find the start edge that:
     // 1. belongs to outer edges of first face;
     // 2. has minimum U-coord of its start point
@@ -562,6 +591,11 @@ static void RelocatePCurvesToNewUorigin(
 
     for (;;) // collect pcurves of a contour
     {
+      USDWatch(__LINE__);
+      // forgent3d patch: each step must take a fresh edge; when no neighbour qualifies CurEdge
+      // stays put and this loop never ended (rounded box + same-radius rounded plate)
+      if (theUsedEdges.Contains(CurEdge))
+        throw Standard_Failure("ShapeUpgrade_UnifySameDomain: a contour walk does not advance");
       RemoveEdgeFromMap(CurEdge, theVEmap);
       theUsedEdges.Add(CurEdge);
       TopoDS_Vertex CurVertex = (anOr == TopAbs_FORWARD)
@@ -1236,6 +1270,7 @@ static Standard_Boolean getCylinder(Handle(Geom_Surface)& theInSurface, gp_Cylin
 
     while (aBasis->IsKind(STANDARD_TYPE(Geom_TrimmedCurve)))
     {
+      USDWatch(__LINE__);
       Handle(Geom_TrimmedCurve) aTc = Handle(Geom_TrimmedCurve)::DownCast(aBasis);
       aBasis                        = aTc->BasisCurve();
     }
@@ -1265,6 +1300,7 @@ static Standard_Boolean getCylinder(Handle(Geom_Surface)& theInSurface, gp_Cylin
 
     while (aBasis->IsKind(STANDARD_TYPE(Geom_TrimmedCurve)))
     {
+      USDWatch(__LINE__);
       Handle(Geom_TrimmedCurve) aTc = Handle(Geom_TrimmedCurve)::DownCast(aBasis);
       aBasis                        = aTc->BasisCurve();
     }
@@ -2636,6 +2672,7 @@ Standard_Boolean ShapeUpgrade_UnifySameDomain::MergeEdges(
       Standard_Boolean isAdded = Standard_True;
       while (isAdded)
       {
+        USDWatch(__LINE__);
         isAdded = Standard_False;
         if (V[j].IsNull())
           break;
@@ -3255,6 +3292,7 @@ void ShapeUpgrade_UnifySameDomain::IntUnifyFaces(
     Standard_Integer           ind_e = 1;
     while (ind_e <= edges.Length())
     {
+      USDWatch(__LINE__);
       const TopoDS_Shape& anEdge = edges(ind_e);
       if (anEdge.Orientation() == TopAbs_INTERNAL)
       {
@@ -3556,11 +3594,13 @@ void ShapeUpgrade_UnifySameDomain::IntUnifyFaces(
       // and build faces
       while (!edges.IsEmpty())
       {
+        USDWatch(__LINE__);
         // try to find non-degenerated edge
         TopoDS_Edge      StartEdge = TopoDS::Edge(edges(1));
         Standard_Integer istart    = 1;
         while (BRep_Tool::Degenerated(StartEdge) && istart < edges.Length())
         {
+          USDWatch(__LINE__);
           istart++;
           StartEdge = TopoDS::Edge(edges(istart));
         }
@@ -3591,8 +3631,17 @@ void ShapeUpgrade_UnifySameDomain::IntUnifyFaces(
         gp_Pnt2d CurPoint   = StartPCurve->Value(CurParam);
 
         TopoDS_Edge CurEdge = StartEdge;
+        // forgent3d patch: every step adds an edge to the wire, so a walk longer than the edges it
+        // can use is going round in circles — it did, forever, merging a rounded box with a plate
+        // whose corner cylinders coincide with the box's and end on its corner spheres. Give up on
+        // this unification (callers catch and keep the unmerged shape).
+        Standard_Integer       aNbSteps  = 0;
+        const Standard_Integer aMaxSteps = 8 * (edges.Length() + VEmap.Extent()) + 100;
         for (;;) // loop till the end of current new wire
         {
+          USDWatch(__LINE__);
+          if (++aNbSteps > aMaxSteps)
+            throw Standard_Failure("ShapeUpgrade_UnifySameDomain: a wire walk does not close");
           TopoDS_Edge NextEdge;
           gp_Pnt2d    NextPoint;
 
@@ -3784,6 +3833,7 @@ void ShapeUpgrade_UnifySameDomain::IntUnifyFaces(
         Standard_Integer ind = 1;
         while (ind <= edges.Length())
         {
+          USDWatch(__LINE__);
           if (UsedEdges.Contains(edges(ind)))
             edges.Remove(ind);
           else
@@ -3829,6 +3879,7 @@ void ShapeUpgrade_UnifySameDomain::IntUnifyFaces(
       TopTools_SequenceOfShape InternalWires;
       while (!InternalEdges.IsEmpty())
       {
+        USDWatch(__LINE__);
         TopoDS_Edge aFirstEdge = TopoDS::Edge(InternalEdges(1));
         InternalEdges.RemoveFromIndex(1);
         TopoDS_Wire anInternalWire;
@@ -3840,6 +3891,7 @@ void ShapeUpgrade_UnifySameDomain::IntUnifyFaces(
         TopExp::Vertices(aFirstEdge, VV[0], VV[1]);
         for (;;)
         {
+          USDWatch(__LINE__);
           if (VV[0].IsSame(VV[1])) // closed wire
             break;
           Standard_Boolean found = Standard_False;
@@ -4057,6 +4109,15 @@ void ShapeUpgrade_UnifySameDomain::UnifyEdges()
 //=======================================================================
 void ShapeUpgrade_UnifySameDomain::Build()
 {
+  THE_USD_STEPS = 0;
+  {
+    // the budget grows with the shape: a few dozen faces spinning on a sphere tangent to a box
+    // spent 68 s per merge against a fixed 5e7 (2686079); a 30,000-face polyhedron keeps its room
+    TopTools_IndexedMapOfShape aFaces;
+    TopExp::MapShapes(myInitShape, TopAbs_FACE, aFaces);
+    const long long aScaled = 1000LL * aFaces.Extent();
+    THE_USD_LIMIT = aScaled > 5000000LL ? aScaled : 5000000LL;
+  }
   TopExp::MapShapesAndAncestors(myInitShape, TopAbs_EDGE, TopAbs_FACE, myEFmap);
 
   if (myUnifyFaces)
@@ -4189,6 +4250,7 @@ void SplitWire(const TopoDS_Wire&                theWire,
     TopTools_ListIteratorOfListOfShape anItl(aBranches);
     while (anItl.More())
     {
+      USDWatch(__LINE__);
       TopoDS_Edge CurEdge = TopoDS::Edge(anItl.Value());
       aBranches.Remove(anItl);
 
@@ -4196,6 +4258,7 @@ void SplitWire(const TopoDS_Wire&                theWire,
       aBB.MakeWire(aNewWire);
       for (;;)
       {
+        USDWatch(__LINE__);
         aBB.Add(aNewWire, CurEdge);
 
         // clang-format off
